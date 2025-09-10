@@ -1,0 +1,98 @@
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+
+# ---------- Load ----------
+df = pd.read_csv("data/results.csv")
+
+# ---------- Standardize columns ----------
+rename_map = {
+    "Question N": "question_id",
+    "Answer_ID": "answer_id",
+    "AI Model": "model",
+    "Task": "task_label",
+    "Specific/ Abstract": "specific_abstract",
+    "Specificity": "specific_abstract",  # if some files use this header
+    "Single-Hop/Multi-Hop": "hop_label",
+    "Automated_Evaluation_Response Relevancy": "ragas_response_relevancy",
+    "Automated_Evaluation_Answer Correctness": "ragas_answer_correctness",
+    "Automated_Evaluation_Relevance Rubric": "relevance_rubric",
+    "Automated_Evaluation_Accuracy Rubric": "accuracy_rubric",
+    "Human_based_Evaluation_Correct": "correct",
+    "Human_based_Evaluation_ Relevant": "relevant",
+    "Human_based_Evaluation_Complete": "complete",
+    "Human_based_Evaluation_Hallucinate": "hallucinate",
+    "HB_Accuracy": "hb_accuracy",
+}
+df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+# ---------- Tidy values ----------
+df["task_label"] = df.get("task_label", pd.Series(dtype="object")).replace({
+    "Open Domain Question Answering (QA)": "OpenQA",
+    "Slot Filling": "SlotFilling",
+    "Inference": "Inference",
+    "Comparison": "Comparison",
+})
+if "specific_abstract" in df:
+    df["specific_abstract"] = (
+        df["specific_abstract"].astype(str).str.replace(r"[()]", "", regex=True).str.strip()
+    )
+
+# Make sure numeric cols are numeric (avoids plotting issues)
+for col in ["ragas_response_relevancy","ragas_answer_correctness",
+            "relevance_rubric","accuracy_rubric","correct","relevant","hb_accuracy"]:
+    if col in df:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# Order models and set palette
+order = ["CGPT", "RALF", "NBLM"]
+df["model"] = pd.Categorical(df["model"], categories=order, ordered=True)
+
+palette = {
+    "CGPT": "#556B2F",  # dark olive green
+    "RALF": "#800020",  # burgundy
+    "NBLM": "#B8860B",  # dark goldenrod
+}
+
+# ---------- Quick sanity ----------
+metrics_to_show = [m for m in [
+    "hb_accuracy", "accuracy_rubric", "relevance_rubric",
+    "ragas_answer_correctness", "ragas_response_relevancy"
+] if m in df.columns]
+
+print("Metrics summary (per column):")
+print(df[metrics_to_show].describe().T)
+
+# ---------- Plot: box + jitter with custom colors ----------
+sns.set_context("talk")
+sns.set_style("whitegrid")
+
+# Turn OFF grids globally for this session
+sns.set_context("talk")
+sns.set_style("white", rc={"axes.grid": False})   # no grid
+plt.rcParams["axes.grid"] = False       
+
+
+
+OUT = Path("figures"); OUT.mkdir(exist_ok=True, parents=True)
+
+for metric in metrics_to_show:
+    plt.figure(figsize=(7, 4))
+    ax = sns.boxplot(
+        data=df, x="model", y=metric,
+        order=order, palette=palette, width=0.6, fliersize=0
+    )
+    sns.stripplot(
+        data=df, x="model", y=metric,
+        order=order, color="black", alpha=0.6, jitter=0.12
+    )
+    ax.set_xlabel("")
+    ax.set_title(f"{metric} by model")
+    ax.grid(False, which="both", axis="both")
+    sns.despine(ax=ax, top=True, right=True)
+    plt.tight_layout()
+    plt.savefig(OUT / f"box_{metric}_by_model.png", dpi=180)
+    plt.show()
