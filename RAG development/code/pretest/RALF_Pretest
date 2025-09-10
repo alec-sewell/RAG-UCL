@@ -1,0 +1,282 @@
+import os
+from dotenv import load_dotenv
+import gradio as gr
+from PyPDF2 import PdfReader
+from langchain.text_splitter import CharacterTextSplitter, RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI # Assuming you are sticking with OpenAI for now
+from langchain_community.vectorstores import FAISS
+from langchain.chains import RetrievalQA, LLMChain
+from langchain.prompts import PromptTemplate
+from langchain.retrievers import EnsembleRetriever 
+from langchain_community.retrievers import BM25Retriever
+import numpy as np
+import time
+import random
+import tempfile
+# from langchain_community.document_loaders import BSHTMLLoader # This was for web scraping HTML, not needed for local PDF
+from langchain.memory import ConversationBufferMemory
+
+import pymupdf as fitz
+import pytesseract # Make sure pytesseract is installed and Tesseract OCR is configured if you're using it for images
+from PIL import Image
+import io
+import pandas as pd
+import filetype # <--- NEW: Import filetype
+
+# Load environment variables
+load_dotenv()
+
+# Constants
+CHUNK_SIZE = 600 # Adjusted for better balance with multiple docs
+CHUNK_OVERLAP = 100
+MAX_TOKENS = 4096
+MODEL_NAME = "gpt-4o"
+TEMPERATURE = 0.7
+
+# Get OpenAI API key from environment variable
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+if not OPENAI_API_KEY:
+    raise ValueError("Please set OPENAI_API_KEY in your .env file")
+
+# Initialize LLM
+llm = ChatOpenAI(
+    api_key=OPENAI_API_KEY,
+    model_name=MODEL_NAME,
+    temperature=TEMPERATURE,
+    max_tokens=MAX_TOKENS
+)
+
+# [ALEC] Changed the QA prompt
+PROMPT = PromptTemplate(
+    template="""Context: {context}
+
+
+Question: {question}
+
+You are a search bot that forms a coherent answer to a user query based on search results that are provided to you.
+If the search results are irrelevant to the question, respond with "I do not have enough information to answer this question."
+Do not base your response on information or knowledge that is not in the search results.
+Make sure your response is answering the query asked
+Consider that each search result is a partial segment from a bigger text, and may be incomplete.
+
+If the question is about images or tables, refer to them specifically in your answer.""",
+    input_variables=["context", "question"]
+)
+
+# --- Modified for single PDF processing (called in a loop for multiple PDFs) ---
+def process_single_pdf_text(pdf_path):
+    """Extract text from a single PDF using PyMuPDF and split into chunks."""
+    doc = fitz.open(pdf_path)
+    text = ""
+    for page in doc:
+        # Use get_text() for cleaner extraction. 'text' is the default output format.
+        text += page.get_text() 
+    doc.close()
+
+    print(f"DEBUG: Total characters extracted from PDF ({os.path.basename(pdf_path)}): {len(text)}")
+    
+    # Use RecursiveCharacterTextSplitter for robust splitting
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, 
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", " ", ""]
+    )
+    texts = text_splitter.split_text(text)
+    
+    print(f"DEBUG: Number of chunks *after* splitting: {len(texts)}")
+    
+    return texts
+
+# --- Modified for single PDF processing (called in a loop for multiple PDFs) ---
+def extract_images_and_tables_single_pdf(pdf_path): # Renamed function
+    """Extract images and tables from a single PDF."""
+    doc = fitz.open(pdf_path)
+    images = []
+    tables = []
+    
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        image_list = page.get_images(full=True)
+        
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+            base_image = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image = Image.open(io.BytesIO(image_bytes))
+            # Include PDF name in metadata for clarity in multi-doc scenario
+            images.append((f"PDF: {os.path.basename(pdf_path)}, Page {page_num + 1}, Image {img_index + 1}", image))
+        
+        tables_on_page = page.find_tables()
+        for table_index, table in enumerate(tables_on_page):
+            df = pd.DataFrame(table.extract())
+            # Include PDF name in metadata for clarity in multi-doc scenario
+            tables.append((f"PDF: {os.path.basename(pdf_path)}, Page {page_num + 1}, Table {table_index + 1}", df))
+    
+    return images, tables
+
+def create_retrievers(all_texts): 
+    """Create embeddings and vector store from text chunks."""
+    embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY) 
+    vectorstore = FAISS.from_texts(all_texts, embeddings)
+    dense_retriever = vectorstore.as_retriever(search_kwargs={"k": 8})
+    sparse_retriever = BM25Retriever.from_texts(all_texts)
+    sparse_retriever.k = 4
+    return dense_retriever, sparse_retriever
+
+def expand_query(query: str, llm: ChatOpenAI) -> str:
+    """Expand the original query with related terms."""
+    prompt = PromptTemplate(
+        input_variables=["query"],
+        template="""Given the following query, generate 3-5 related terms or phrases that could be relevant to the query. 
+        Separate the terms with commas.
+        
+        Query: {query}
+        
+        Related terms:"""
+    )
+    chain = LLMChain(llm=llm, prompt=prompt)
+    response = chain.invoke({"query": query}) # Use invoke with dict for latest LangChain
+    expanded_terms = [term.strip() for term in response['text'].split(',')] # Access 'text' from response
+    expanded_query = f"{query} {' '.join(expanded_terms)}"
+    return expanded_query
+
+# --- Modified to accept llm_instance for expand_query ---
+def rag_pipeline(query, qa_chain, retriever, images, tables, llm_instance):
+    # ...
+    expanded_query = expand_query(query, llm_instance)
+    relevant_docs = retriever.get_relevant_documents(expanded_query)
+    
+    context = ""
+    log = "Query Expansion:\n"
+    log += f"Original query: {query}\n"
+    log += f"Expanded query: {expanded_query}\n\n"
+    log += "Relevant chunks (Hybrid):\n"
+    
+    # NEW: Loop now only expects a single doc object
+    for i, doc in enumerate(relevant_docs, 1):
+        context += doc.page_content + "\n\n"
+        log += f"Chunk {i}:\n" # Removed score, since EnsembleRetriever doesn't provide it
+        log += f"Sample: {doc.page_content[:200]}...\n\n"
+    
+    # Add information about images and tables to the context (counts)
+    log += f"Number of images in all PDFs: {len(images)}\n"
+    log += f"Number of tables in all PDFs: {len(tables)}\n\n"
+    
+    response = qa_chain.invoke({"query": query})
+    return response['result'], log
+
+# --- NEW main processing function for multiple PDFs ---
+def process_pdfs_and_query(pdf_files_list, query): # Renamed parameter for clarity
+    """Process multiple PDF files, extract content, and handle the query."""
+    all_texts = []
+    all_images = []
+    all_tables = []
+    
+    processing_log = "--- PDF Processing Log ---\n"
+    
+    if not pdf_files_list: # Check if the list is empty
+        return "No PDF files uploaded.", processing_log 
+
+    for pdf_file_obj in pdf_files_list: # Iterate through each uploaded file object
+        pdf_path = pdf_file_obj.name # Gradio File object has a 'name' attribute which is the local temp path
+        
+        # --- NEW: Manual File Type Validation ---
+        actual_mime_type = "UNKNOWN"
+        try:
+            # Try to get the actual file type using 'filetype' library
+            actual_mime_type = filetype.guess_mime(pdf_path)
+            print(f"DEBUG: Detected MIME type for {os.path.basename(pdf_path)}: {actual_mime_type}")
+        except Exception as e:
+            processing_log += f"  - WARNING: Could not determine MIME type for {os.path.basename(pdf_path)}: {e}\n"
+            print(f"WARNING: Could not determine MIME type for {os.path.basename(pdf_path)}: {e}")
+            
+        if actual_mime_type != "application/pdf":
+            processing_log += f"  - SKIPPING: '{os.path.basename(pdf_path)}' is not a PDF (detected as {actual_mime_type}).\n"
+            print(f"SKIPPING: '{os.path.basename(pdf_path)}' is not a PDF (detected as {actual_mime_type}).")
+            continue # Skip to the next file if not a PDF
+        # --- END NEW VALIDATION ---
+
+        processing_log += f"Processing PDF: {os.path.basename(pdf_path)}\n"
+        
+        try:
+            texts_from_pdf = process_single_pdf_text(pdf_path) # Call the single PDF text processor
+            images_from_pdf, tables_from_pdf = extract_images_and_tables_single_pdf(pdf_path) # Call single PDF image/table processor
+            
+            all_texts.extend(texts_from_pdf) # Add chunks from this PDF to the combined list
+            all_images.extend(images_from_pdf) # Correctly add images from this PDF
+            all_tables.extend(tables_from_pdf) # Correctly add tables from this PDF
+            
+            processing_log += f"  - Chunks extracted: {len(texts_from_pdf)}\n"
+            processing_log += f"  - Images extracted: {len(images_from_pdf)}\n"
+            processing_log += f"  - Tables extracted: {len(tables_from_pdf)}\n"
+            
+        except Exception as e:
+            processing_log += f"  - ERROR processing {os.path.basename(pdf_path)}: {e}\n"
+            print(f"Error processing {os.path.basename(pdf_path)}: {e}")
+            continue # Skip to the next PDF if one fails
+
+    if not all_texts:
+        return "No text content could be extracted from any of the provided PDFs. Please ensure they contain selectable text.", processing_log
+
+    processing_log += f"\n--- Combined Processing Summary ---\n"
+    processing_log += f"Total number of text chunks from all PDFs: {len(all_texts)}\n"
+    processing_log += f"Total number of images extracted from all PDFs: {len(all_images)}\n"
+    processing_log += f"Total number of tables extracted from all PDFs: {len(all_tables)}\n\n"
+
+    print("Creating embeddings and vector store from all combined chunks...")
+    dense_retriever, sparse_retriever = create_retrievers(all_texts)
+
+    hybrid_retriever = EnsembleRetriever(
+        retrievers=[dense_retriever, sparse_retriever], 
+        weights=[0.5, 0.5] # These weights balance dense vs. sparse search
+    )
+    
+    qa = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+         # Use MMR as the search type
+        retriever=hybrid_retriever, # Use the new hybrid retriever
+        chain_type_kwargs={"prompt": PROMPT}
+    )
+    
+    print("\nRAG Pipeline initialized. Running query...")
+   
+   
+    result, chunks_log = rag_pipeline(query, qa, hybrid_retriever, all_images, all_tables, llm) 
+    
+    final_log = processing_log + chunks_log
+    
+    return result, final_log
+
+# --- Modified Gradio interface function ---
+def gradio_interface(pdf_files_list_from_gradio, query): 
+    """Gradio interface function."""
+    # Gradio passes a list of file objects if file_count="multiple"
+    if not pdf_files_list_from_gradio: 
+        return "Please upload at least one PDF file.", "No PDFs uploaded."
+
+    # Pass the list of file objects to the processing function
+    result, full_log = process_pdfs_and_query(pdf_files_list_from_gradio, query)
+    
+    return result, full_log
+
+def main():
+    """Main function to launch the Gradio interface."""
+    iface = gr.Interface(
+        fn=gradio_interface,
+        inputs=[
+            gr.File(label="Upload PDFs", file_count="multiple"), 
+            gr.Textbox(label="Enter your question")
+        ],
+        outputs=[
+            gr.Textbox(label="Answer"),
+            gr.Textbox(label="Processing Log")
+        ],
+        title="RAG Pretest (Multiple PDFs)",
+        description="Langchain+Chatgpt4omini Pretest UI for WELL Certification with multi-PDF support."
+    )
+    
+    iface.launch()
+
+if __name__ == "__main__":
+    main()
