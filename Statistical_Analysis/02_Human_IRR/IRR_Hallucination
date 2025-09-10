@@ -1,0 +1,60 @@
+import pandas as pd
+from sklearn.metrics import cohen_kappa_score
+import io
+
+# 1. Prepare your data
+# We'll load your data directly from a string into a pandas DataFrame.
+data = """
+Answer_ID,H1_Hallucination,H2_Hallucination
+1A,0,0
+1B,0,0
+1C,0,0
+2A,1,0
+2B,0,1
+2C,0,0
+3A,0,0
+3B,0,1
+3C,0,1
+4A,1,0
+4B,1,0
+4C,0,0
+5A,0,0
+5B,0,0
+5C,1,0
+6A,0,1
+6B,0,1
+6C,0,0
+7A,0,0
+7B,1,1
+7C,1,1
+8A,0,0
+8B,0,0
+8C,0,0
+9A,0,0
+9B,1,1
+9C,0,1
+
+"""
+
+df = pd.read_csv(io.StringIO(data))
+
+# For this calculation, we need the raw scores from each human.
+
+h1_hallucination = df['H1_Hallucination']
+h2_hallucination = df['H2_Hallucination']
+
+# 2. Calculate Cohen's Kappa for each metric
+kappa_hallucination = cohen_kappa_score(h1_hallucination, h2_hallucination)
+
+# 3. For ordinal scales (like 1-5), it's often better to use a "weighted" Kappa.
+# This gives partial credit for close disagreements (e.g., a 4 vs 5 is better than a 1 vs 5).
+# 'quadratic' weighting is a common and robust choice.
+weighted_kappa_hallucinate = cohen_kappa_score(h1_hallucination, h2_hallucination, weights='linear')
+
+# Print the results
+print("Inter-Rater Reliability Analysis:")
+print("-" * 35)
+#print(f"Correctness (Standard Kappa): {kappa_correct:.2f} (Fair Agreement)")
+#print(f"Relevance (Standard Kappa):   {kappa_relevant:.2f} (Fair Agreement)")
+print(f"Hallucination (Standard Kappa): {kappa_hallucination:.2f} (Moderate Agreement)")
+print("-" * 35)
