@@ -1,0 +1,120 @@
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from itertools import combinations
+from scipy import stats
+
+# -------- Load & rename --------
+df = pd.read_csv("data/results.csv")
+
+rename_map = {
+    "Question N": "question_id",
+    "Answer_ID": "answer_id",
+    "AI Model": "model",
+    "Automated_Evaluation_Response Relevancy": "ragas_response_relevancy",
+    "Automated_Evaluation_Answer Correctness": "ragas_answer_correctness",
+    "Automated_Evaluation_Accuracy Rubric": "accuracy_rubric",
+    "HB_Accuracy": "hb_accuracy",
+}
+df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+# Ensure numeric
+for c in ["ragas_response_relevancy","ragas_answer_correctness","accuracy_rubric","hb_accuracy"]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+# Expected model order (adjust if needed)
+models = ["CGPT","RALF","NBLM"]
+df["model"] = pd.Categorical(df["model"], categories=models, ordered=True)
+
+metrics = [m for m in ["ragas_response_relevancy","ragas_answer_correctness","accuracy_rubric","hb_accuracy"]
+           if m in df.columns]
+
+# -------- Helpers --------
+def friedman_for_metric(df_in, metric, models):
+    """
+    Pivot to wide (questions × models), drop incomplete rows,
+    run Friedman test; returns dict (no Kendall’s W) and the wide table.
+    """
+    sub = df_in[["question_id","model",metric]].dropna()
+    wide = sub.pivot_table(index="question_id", columns="model", values=metric, aggfunc="first")
+    # keep only questions with all models present
+    wide = wide[models].dropna()
+    n_blocks = wide.shape[0]
+    k_levels = len(models)
+    if n_blocks < 3:
+        return None, wide  
+
+    # Friedman expects arrays of equal length (one per model)
+    arrays = [wide[m].values for m in models]
+    chi2, p = stats.friedmanchisquare(*arrays)
+    dof = k_levels - 1
+
+    result = {
+        "metric": metric,
+        "models": " ".join(models),
+        "n_blocks": int(n_blocks),
+        "k_levels": int(k_levels),
+        "chi2": float(chi2),
+        "df": int(dof),
+        "p_value": float(p),
+    }
+    return result, wide
+
+def pairwise_wilcoxon_raw(wide_df, models):
+    """
+    Pairwise Wilcoxon signed-rank on matched blocks (rows of wide_df).
+    Returns tidy dataframe with raw p-values only (no Holm adjustment).
+    Also reports a simple effect size r = |Z| / sqrt(N).
+    """
+    rows = []
+    n = wide_df.shape[0]
+    for a, b in combinations(models, 2):
+        x = wide_df[a].values
+        y = wide_df[b].values
+        stat, p = stats.wilcoxon(x, y, zero_method="pratt", alternative="two-sided", method="auto")
+        # Approximate Z from p (two-sided): protect against 0/1
+        p_clip = np.clip(p, 1e-16, 1-1e-16)
+        z = stats.norm.isf(p_clip/2.0) * np.sign(np.mean(x - y))
+        r = abs(z) / np.sqrt(n)
+        rows.append({"contrast": f"{a} vs {b}", "n": n, "W_stat": stat, "p_value": p, "effect_r": r})
+    out = pd.DataFrame(rows).sort_values("contrast").reset_index(drop=True)
+    return out
+
+# -------- Run tests and save --------
+OUT = Path("tables"); OUT.mkdir(parents=True, exist_ok=True)
+friedman_rows = []
+
+# Store post-hoc ONLY for ragas_response_relevancy
+posthoc_ragas = None
+
+for metric in metrics:
+    res, wide = friedman_for_metric(df, metric, models)
+    if res is None:
+        print(f"[{metric}] Not enough matched questions after pivot; skipping.")
+        continue
+    friedman_rows.append(res)
+
+    if metric == "ragas_response_relevancy":
+        posthoc_ragas = pairwise_wilcoxon_raw(wide, models)
+        posthoc_ragas.to_csv(OUT / "posthoc_wilcoxon_ragas_response_relevancy.csv", index=False)
+        # (Optional) save the matched table used, for reproducibility
+        wide.reset_index().to_csv(OUT / "matched_table_ragas_response_relevancy.csv", index=False)
+
+friedman_df = pd.DataFrame(friedman_rows)
+friedman_df.to_csv(OUT / "friedman_results_appendix.csv", index=False)
+
+print("\nFriedman results (appendix):")
+pd.options.display.float_format = "{:.4f}".format
+print(friedman_df)
+
+if posthoc_ragas is not None:
+    print("\nPairwise Wilcoxon (ragas_response_relevancy only), raw p-values:")
+    print(posthoc_ragas)
+
+print("\nSaved CSVs in 'tables/':")
+print(" - friedman_results_appendix.csv")
+if posthoc_ragas is not None:
+    print(" - posthoc_wilcoxon_ragas_response_relevancy.csv")
+    print(" - matched_table_ragas_response_relevancy.csv")

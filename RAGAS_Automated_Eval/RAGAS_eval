@@ -3,159 +3,49 @@
 
 """
 RAG Evaluation (Relevance & Accuracy) with RAGAS
-- Supports black-box RAG (no retrieved docs) via RubricsScore
-- Supports retrieval-aware scoring via ResponseRelevancy + answer_correctness
-- Outputs per-query scores + aggregated stats + bootstrap CIs
+- Supports black-box RAG via RubricsScore.
+- Supports retrieval-aware scoring via ResponseRelevancy and answer_correctness.
+- Outputs per-query scores, aggregated stats, and bootstrap CIs.
 """
-
-import os, json, re, random, math
+import asyncio
+import atexit
+import json
+import math
+import os
+import random
+import re
+from pathlib import Path
+from typing import Any, List, Coroutine, Dict, Tuple
 import numpy as np
 import pandas as pd
-import atexit
-from ragas.llms import LangchainLLMWrapper
-from ragas.embeddings import LangchainEmbeddingsWrapper
-from ragas.metrics import ResponseRelevancy
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from tqdm import tqdm
-import asyncio
 from datasets import Dataset
+from dotenv import find_dotenv, load_dotenv
+from tqdm import tqdm
+from langchain_openai import ChatOpenAI
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from ragas import evaluate
+from ragas.dataset_schema import SingleTurnSample
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from ragas.llms import LangchainLLMWrapper
+from ragas.metrics import ResponseRelevancy, RubricsScore, answer_correctness
 
-from dotenv import load_dotenv, find_dotenv
-load_dotenv(find_dotenv())
-
-# ---------- Config ----------
-SEED = 42
-random.seed(SEED); np.random.seed(SEED)
-
-INPUT_CSV = "testset.csv"           # change to your path
-OUTPUT_RESULTS_CSV = "rag_eval_results.csv"
-OUTPUT_SUMMARY_CSV = "rag_eval_summary.csv"
-USE_RETRIEVAL_IF_AVAILABLE = False   # set False to force black-box mode
-
-# ---------- Text normalization ----------
 try:
     from unidecode import unidecode
     USE_UNIDECODE = True
-except:
+except ImportError:
     USE_UNIDECODE = False
 
-def normalize_text(s) -> str:
-    # Handle None/NaN/float
-    if s is None:
-        return ""
-    try:
-        # Pandas NaN is a float and not equal to itself
-        if isinstance(s, float) and math.isnan(s):
-            return ""
-    except Exception:
-        pass
+load_dotenv(find_dotenv())
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
 
-    # Coerce everything to string
-    s = str(s)
+# --- Configuration ---
+INPUT_CSV = Path("testset.csv")
+OUTPUT_RESULTS_CSV = Path("rag_eval_results.csv")
+OUTPUT_SUMMARY_CSV = Path("rag_eval_summary.csv")
 
-    s = s.strip()
-    if USE_UNIDECODE:
-        s = unidecode(s)
-    s = s.lower()
-    s = re.sub(r"\s+", " ", s)
-    # keep punctuation for LLM evaluators
-    return s
-
-from pathlib import Path
-
-def load_dataset(path: str) -> pd.DataFrame:
-    # Read as strings; keep empty strings (no NaN)
-    df = pd.read_csv(
-        path,
-        dtype=str,
-        keep_default_na=False,   # prevents empty -> NaN
-        na_filter=False,         # speeds up & keeps raw strings
-        encoding="utf-8-sig"     # handles BOM if present
-    )
-
-    required = {"query", "grounded_answer", "rag_output"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"CSV is missing required columns: {missing}")
-
-    # Ensure required cols are strings with no NaN
-    for col in ["query", "grounded_answer", "rag_output"]:
-        df[col] = df[col].astype(str).fillna("")
-
-    # Optional column: retrieved_docs as JSON string
-    if "retrieved_docs" not in df.columns:
-        df["retrieved_docs"] = "[]"
-    else:
-        df["retrieved_docs"] = df["retrieved_docs"].astype(str).fillna("")
-        # Normalize to JSON list string
-        def _sanitize_docs(x: str) -> str:
-            x = (x or "").strip()
-            if not x:
-                return "[]"
-            if (x.startswith("[") and x.endswith("]")) or (x.startswith("{") and x.endswith("}")):
-                return x
-            # treat as a single snippet string
-            import json as _json
-            return _json.dumps([x], ensure_ascii=False)
-        df["retrieved_docs"] = df["retrieved_docs"].apply(_sanitize_docs)
-
-    return df
-
-
-# ---------- RAGAS imports ----------
-from ragas import evaluate
-from ragas.dataset_schema import SingleTurnSample
-from ragas.metrics import answer_correctness
-from langchain_community.vectorstores import FAISS
-
-# Some RAGAS versions name this metric/class slightly differently.
-# For rubric scoring (1–5), we’ll use RubricsScore:
-from ragas.metrics import RubricsScore
-
-
-
-# ---------- Evaluator LLM wiring ----------
-# Choose ONE: OpenAI / LiteLLM / HF / your in-house
-# Here is a generic OpenAI example; replace with your own evaluator LLM.
-EVALUATOR_LLM = None
-EVALUATOR_EMBEDDINGS = None
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
-if not GOOGLE_API_KEY:
-    raise ValueError("Please set GOOGLE_API_KEY in your .env file")
-
-def setup_openai_evaluator(model_name: str = "gpt-4o"):
-    # ---- Option A: LangChain LLM style (most compatible with RAGAS) ----
-    try:
-        from langchain_openai import ChatOpenAI
-        chat = ChatOpenAI(model=model_name, temperature=0)
-        return LangchainLLMWrapper(chat)
-    except Exception:
-        pass
-
-    # Fallback: raise to tell the user to install langchain_openai
-    raise RuntimeError(
-        "Please `pip install langchain_openai` or swap in your evaluator LLM that RAGAS accepts."
-    )
-
-def setup_google_embeddings():
-    try:
-        from langchain_google_genai import GoogleGenerativeAIEmbeddings
-        ge = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        # Wrap for RAGAS
-        return LangchainEmbeddingsWrapper(ge)
-        
-    except Exception:
-        return None  
-
-
-
-def init_evaluator():
-    global EVALUATOR_LLM, EVALUATOR_EMBEDDINGS
-    EVALUATOR_LLM = setup_openai_evaluator()
-    EVALUATOR_EMBEDDINGS = setup_google_embeddings()
-
-# ---------- Rubric templates (you can edit or load from file) ----------
+# Rubric templates can be edited here or loaded from a file
 RUBRIC_RELEVANCE = {
     "score1_description": "The response is entirely off-topic or irrelevant to the user query.",
     "score2_description": "Mostly off-topic; only tangentially related to the query.",
@@ -163,7 +53,6 @@ RUBRIC_RELEVANCE = {
     "score4_description": "Mostly focused on the query with minor digressions or unnecessary details.",
     "score5_description": "Fully relevant and focused on the user query.",
 }
-
 RUBRIC_ACCURACY = {
     "score1_description": "Completely incorrect, contradicts the reference, or fabricates facts.",
     "score2_description": "Partially accurate but with major errors or omissions that change meaning.",
@@ -172,120 +61,143 @@ RUBRIC_ACCURACY = {
     "score5_description": "Fully accurate, precise, and consistent with the reference.",
 }
 
-# ---------- Helpers ----------
-def bootstrap_ci(values, n_boot=2000, alpha=0.05, seed=SEED):
-    rng = np.random.default_rng(seed)
-    values = np.array(values, dtype=float)
-    if len(values) == 0:
-        return (math.nan, math.nan)
-    means = []
-    for _ in range(n_boot):
-        sample = rng.choice(values, size=len(values), replace=True)
-        means.append(sample.mean())
-    low = np.percentile(means, 100 * (alpha / 2))
-    high = np.percentile(means, 100 * (1 - alpha / 2))
-    return (float(low), float(high))
+# --- Text and Data Helpers ---
 
-def _shutdown_grpc_aio():
-    try:
-        from grpc import aio as grpc_aio
-        grpc_aio.shutdown_grpc_aio()
-    except Exception:
-        pass
-atexit.register(_shutdown_grpc_aio)
+def normalize_text(s: Any) -> str:
+    """Converts a value to a normalized string for comparison."""
+    if s is None or (isinstance(s, float) and math.isnan(s)):
+        return ""
 
-def to_hf_dataset_for_correctness(df: pd.DataFrame) -> Dataset:
-    # RAGAS answer_correctness expects: question, answer, ground_truth
-    data = {
-        "question": df["query"].tolist(),
-        "answer": df["rag_output"].tolist(),
-        "ground_truth": df["grounded_answer"].tolist(),
-    }
-    return Dataset.from_dict(data)
+    s = str(s).strip()
+    if USE_UNIDECODE:
+        s = unidecode(s)
+    s = s.lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-# ---------- Main evaluation ----------
-def main():
-    print("Loading data…")
-    df = load_dataset(INPUT_CSV)
+def _sanitize_retrieved_docs(docs_str: str) -> str:
+    """Ensure the retrieved_docs string is a valid JSON list string."""
+    docs_str = (docs_str or "").strip()
+    if not docs_str:
+        return "[]"
+    # If it looks like a JSON array or object, trust it.
+    if (docs_str.startswith("[") and docs_str.endswith("]")) or \
+            (docs_str.startswith("{") and docs_str.endswith("}")):
+        return docs_str
+    # Otherwise, treat as a single document string and wrap in a JSON list.
+    return json.dumps([docs_str], ensure_ascii=False)
 
-    # Keep originals for rubric prompts; also build normalized variants
+def load_and_prepare_dataset(path: Path) -> pd.DataFrame:
+    """Loads the dataset from a CSV and prepares the necessary columns."""
+    df = pd.read_csv(
+        path,
+        dtype=str,
+        keep_default_na=False,
+        na_filter=False,
+        encoding="utf-8-sig"
+    )
+
+    required = {"query", "grounded_answer", "rag_output"}
+    if not required.issubset(df.columns):
+        raise ValueError(f"CSV is missing required columns: {required - set(df.columns)}")
+
+    for col in required:
+        df[col] = df[col].astype(str).fillna("")
+
+    if "retrieved_docs" not in df.columns:
+        df["retrieved_docs"] = "[]"
+    else:
+        df["retrieved_docs"] = df["retrieved_docs"].astype(str).fillna("").apply(_sanitize_retrieved_docs)
+
+    # Create normalized versions for potential analysis
     df["query_norm"] = df["query"].apply(normalize_text)
     df["grounded_norm"] = df["grounded_answer"].apply(normalize_text)
     df["rag_norm"] = df["rag_output"].apply(normalize_text)
 
-    print("Initializing evaluator LLM…")
-    init_evaluator()
+    return df
 
-    per_row_records = []
+def to_hf_dataset_for_correctness(df: pd.DataFrame) -> Dataset:
+    """Converts a DataFrame to a Hugging Face Dataset for the correctness metric."""
+    return Dataset.from_dict({
+        "question": df["query"].tolist(),
+        "answer": df["rag_output"].tolist(),
+        "ground_truth": df["grounded_answer"].tolist(),
+    })
 
-    # ---- Metrics path 1: Black-box compatible (Rubrics 1–5) ----
-    # Relevance via rubric (needs only query & response)
-    relevance_rubric_scorer = RubricsScore(rubrics=RUBRIC_RELEVANCE, llm=EVALUATOR_LLM)
-    # Accuracy via rubric (needs response & reference)
-    accuracy_rubric_scorer = RubricsScore(rubrics=RUBRIC_ACCURACY, llm=EVALUATOR_LLM)
+# --- Evaluator Setup ---
 
-    # ---- Metrics path 2: Example-based numeric scores (0–1) ----
-    # Correctness: built-in RAGAS metric
-    hf_dataset = to_hf_dataset_for_correctness(df)
-    correctness_scores = evaluate(hf_dataset, metrics=[answer_correctness]).to_pandas()
-    # The dataframe will contain a column like 'answer_correctness'
-    correctness_list = correctness_scores["answer_correctness"].tolist()
-
-    # Relevance (0–1) with retrieval if available; otherwise skip and rely on rubric relevance
-    
-    
-    # ---- Response relevancy scorer (query-only; embeddings required by RAGAS) ----
-    response_relevancy_scorer = None
+def setup_openai_evaluator(model_name: str = "gpt-4o") -> LangchainLLMWrapper:
+    """Initializes the OpenAI LLM for evaluation."""
+    if not os.getenv("OPENAI_API_KEY"):
+        raise ValueError("Please set OPENAI_API_KEY in your .env file")
     try:
-        response_relevancy_scorer = ResponseRelevancy(
-            llm=EVALUATOR_LLM,
-            embeddings=EVALUATOR_EMBEDDINGS  
-        )
-        # Optional: quick sanity print
-        print("[DEBUG] ResponseRelevancy ready:",
-            type(EVALUATOR_LLM).__name__, type(EVALUATOR_EMBEDDINGS).__name__)
-    except Exception as e:
-        print("[WARN] ResponseRelevancy init failed:", repr(e))
-        raise RuntimeError(f"ResponseRelevancy init failed: {e!r}")
+        chat = ChatOpenAI(model=model_name, temperature=0)
+        return LangchainLLMWrapper(chat)
+    except ImportError:
+        raise RuntimeError("Please `pip install langchain_openai` to use OpenAI evaluators.")
 
+def setup_google_embeddings() -> LangchainEmbeddingsWrapper:
+    """Initializes Google Generative AI embeddings for evaluation."""
+    if not os.getenv("GOOGLE_API_KEY"):
+        raise ValueError("Please set GOOGLE_API_KEY in your .env file")
+    try:
+        ge = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        return LangchainEmbeddingsWrapper(ge)
+    except ImportError:
+        raise RuntimeError("Please `pip install langchain-google-genai` to use Google embeddings.")
 
+def initialize_evaluators() -> Tuple[LangchainLLMWrapper, LangchainEmbeddingsWrapper]:
+    """Sets up and returns the LLM and embedding models for RAGAS."""
+    print("Initializing evaluator LLM and embeddings…")
+    evaluator_llm = setup_openai_evaluator()
+    evaluator_embeddings = setup_google_embeddings()
+    return evaluator_llm, evaluator_embeddings
 
+# --- Async and Scoring Helpers ---
 
-    print("Scoring per query…")
+def run_sync(coro: Coroutine) -> Any:
+    """Runs a coroutine synchronously, handling different RAGAS versions."""
+    if hasattr(coro, "__await__"):
+        return asyncio.get_event_loop().run_until_complete(coro)
+    return coro
+
+def bootstrap_ci(values: List[float], n_boot: int = 2000, alpha: float = 0.05) -> Tuple[float, float]:
+    """Calculates the bootstrap confidence interval for a list of values."""
+    if not values:
+        return (math.nan, math.nan)
+    rng = np.random.default_rng(SEED)
+    values = np.array(values, dtype=float)
+    means = [rng.choice(values, size=len(values), replace=True).mean() for _ in range(n_boot)]
+    return np.percentile(means, [100 * (alpha / 2), 100 * (1 - alpha / 2)])
+
+# --- Core Evaluation Logic ---
+
+def calculate_scores(df: pd.DataFrame, llm: LangchainLLMWrapper, embeddings: LangchainEmbeddingsWrapper) -> pd.DataFrame:
+    """Calculates all RAGAS scores for the given dataset."""
+
+    # --- Batch-calculate answer_correctness (0-1) ---
+    print("Scoring 'answer_correctness' across the dataset...")
+    hf_dataset = to_hf_dataset_for_correctness(df)
+    correctness_results = evaluate(hf_dataset, metrics=[answer_correctness], llm=llm, embeddings=embeddings)
+    correctness_list = correctness_results.to_pandas()["answer_correctness"].tolist()
+
+    # --- Initialize scorers for per-row evaluation ---
+    relevance_rubric_scorer = RubricsScore(rubrics=RUBRIC_RELEVANCE, llm=llm)
+    accuracy_rubric_scorer = RubricsScore(rubrics=RUBRIC_ACCURACY, llm=llm)
+    response_relevancy_scorer = ResponseRelevancy(llm=llm, embeddings=embeddings)
+
+    # --- Score each row for remaining metrics ---
+    print("Scoring relevance and accuracy per query...")
+    per_row_records = []
     for i, row in tqdm(df.iterrows(), total=len(df)):
-        query = row["query"]
-        reference = row["grounded_answer"]
-        response = row["rag_output"]
+        query, reference, response = row["query"], row["grounded_answer"], row["rag_output"]
 
-        # Build SingleTurnSample for rubric scorers
-        # For accuracy rubric: we use 'reference' (gold) and 'response'
-        acc_sample = SingleTurnSample(response=response, reference=reference)
+        # Rubrics-based scores (1-5)
+        rel_rubric = run_sync(relevance_rubric_scorer.single_turn_ascore(SingleTurnSample(user_input=query, response=response)))
+        acc_rubric = run_sync(accuracy_rubric_scorer.single_turn_ascore(SingleTurnSample(response=response, reference=reference)))
 
-        # For relevance rubric: we use 'query' as "user_input" and 'response'
-        # Some RAGAS versions accept 'user_input' or 'query'; SingleTurnSample supports 'user_input' field.
-        rel_sample = SingleTurnSample(user_input=query, response=response)
-
-        # 1) Rubrics-based relevance (1–5)
-        rel_rubric = relevance_rubric_scorer.single_turn_ascore(rel_sample)
-        if hasattr(rel_rubric, "__await__"):  # async in some versions
-            rel_rubric = asyncio.get_event_loop().run_until_complete(rel_rubric)
-
-        # 2) Rubrics-based accuracy (1–5)
-        acc_rubric = accuracy_rubric_scorer.single_turn_ascore(acc_sample)
-        if hasattr(acc_rubric, "__await__"):
-            acc_rubric = asyncio.get_event_loop().run_until_complete(acc_rubric)
-
-        # 3) Answer correctness (0–1) from vector (already computed)
-        ans_correctness = correctness_list[i]
-
-        # 4) Response relevancy (0–1) with retrieval, if we have contexts
-        resp_relevancy = None
-        if response_relevancy_scorer is not None:
-            rel_q = SingleTurnSample(user_input=query, response=response)
-            rr = response_relevancy_scorer.single_turn_ascore(rel_q)
-            if hasattr(rr, "__await__"):
-                rr = asyncio.get_event_loop().run_until_complete(rr)
-            resp_relevancy = float(rr)
+        # Response Relevancy (0-1)
+        resp_relevancy = run_sync(response_relevancy_scorer.single_turn_ascore(SingleTurnSample(user_input=query, response=response)))
 
         per_row_records.append({
             "idx": i,
@@ -294,50 +206,63 @@ def main():
             "response": response,
             "relevance_rubric_1to5": float(rel_rubric),
             "accuracy_rubric_1to5": float(acc_rubric),
-            "answer_correctness_0to1": float(ans_correctness),
-            "response_relevancy_0to1": resp_relevancy,
+            "answer_correctness_0to1": float(correctness_list[i]),
+            "response_relevancy_0to1": float(resp_relevancy),
         })
 
-        # Write per-query CSV
-    df_scores = pd.DataFrame(per_row_records)
-    df_scores.to_csv(OUTPUT_RESULTS_CSV, index=False)
+    return pd.DataFrame(per_row_records)
 
-        # Aggregation
-    df_scores = pd.DataFrame(per_row_records)
+def generate_summary(df_scores: pd.DataFrame) -> pd.DataFrame:
+    """Generates a summary DataFrame with aggregated statistics."""
 
-    def agg(col):
+    def agg(col: str) -> Dict[str, Any]:
         vals = df_scores[col].dropna().tolist()
-        avg = float(np.mean(vals)) if vals else float("nan")
-        std = float(np.std(vals, ddof=1)) if len(vals) > 1 else float("nan")
-        low, high = bootstrap_ci(vals) if vals else (float("nan"), float("nan"))
-        return avg, std, low, high
+        if not vals:
+            return {"n": 0, "mean": math.nan, "std": math.nan, "ci95_low": math.nan, "ci95_high": math.nan}
 
-    summary = {}
-    for metric in ["relevance_rubric_1to5", "accuracy_rubric_1to5",
-                    "answer_correctness_0to1", "response_relevancy_0to1"]:
-        avg, std, low, high = agg(metric)
-        summary[metric] = {
-            "n": int(df_scores[metric].notna().sum()),
-            "mean": avg, "std": std,
-            "ci95_low": low, "ci95_high": high
+        low, high = bootstrap_ci(vals)
+        return {
+            "n": len(vals),
+            "mean": float(np.mean(vals)),
+            "std": float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0,
+            "ci95_low": float(low),
+            "ci95_high": float(high),
         }
 
     summary_rows = []
-    for metric, stats in summary.items():
-        row = {"metric": metric}
-        row.update(stats)
-        summary_rows.append(row)
+    for metric in ["relevance_rubric_1to5", "accuracy_rubric_1to5", "answer_correctness_0to1", "response_relevancy_0to1"]:
+        stats = agg(metric)
+        stats["metric"] = metric
+        summary_rows.append(stats)
 
-    df_summary = pd.DataFrame(summary_rows)
+    return pd.DataFrame(summary_rows)
+
+# --- Main Execution ---
+
+def main():
+    """Main function to run the RAG evaluation pipeline."""
+    df = load_and_prepare_dataset(INPUT_CSV)
+    evaluator_llm, evaluator_embeddings = initialize_evaluators()
+
+    df_scores = calculate_scores(df, evaluator_llm, evaluator_embeddings)
+    df_scores.to_csv(OUTPUT_RESULTS_CSV, index=False)
+    print(f"\nSaved per-query results to {OUTPUT_RESULTS_CSV}")
+
+    df_summary = generate_summary(df_scores)
     df_summary.to_csv(OUTPUT_SUMMARY_CSV, index=False)
+    print(f"Saved summary to {OUTPUT_SUMMARY_CSV}")
 
     print("\n=== Aggregated Results ===")
     print(df_summary.to_string(index=False))
-    print(f"\nSaved per-query results to {OUTPUT_RESULTS_CSV} and summary to {OUTPUT_SUMMARY_CSV}\n")
 
+def _shutdown_grpc_aio():
+    """Gracefully shutdown gRPC asyncio channels on exit."""
+    try:
+        from grpc import aio as grpc_aio
+        grpc_aio.shutdown_grpc_aio()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
-    # Some RAGAS versions require asyncio run for async scorers;
-    # this script uses sync calls; if your version is fully async,
-    # we can switch to asyncio.run(main_async()).
+    atexit.register(_shutdown_grpc_aio)
     main()

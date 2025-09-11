@@ -1,0 +1,56 @@
+# Hallucination rate by model with Wilson 95% CI + bar chart
+import pandas as pd, numpy as np
+from scipy.stats import norm
+import matplotlib.pyplot as plt
+from math import sqrt
+
+# --- Load your data ---
+df = pd.read_csv("hallu_rank.csv")  # must have columns: "AI Model", "Adjudicated Hallucination"
+# Example: df = pd.DataFrame({...})
+# Ensure binary ints (1 = hallucination present, 0 = none)
+df["Adjudicated Hallucination"] = df["Adjudicated Hallucination"].astype(int)
+
+# --- Wilson score interval for a binomial proportion ---
+def wilson_ci(k, n, alpha=0.05):
+    if n == 0:
+        return np.nan, np.nan
+    z = norm.ppf(1 - alpha/2)
+    phat = k / n
+    denom = 1 + (z**2)/n
+    centre = (phat + (z**2)/(2*n)) / denom
+    half   = (z * sqrt((phat*(1-phat)/n) + ((z**2)/(4*n*n)))) / denom
+    return centre - half, centre + half
+
+# --- Per-model proportion + CI ---
+tab = (df.groupby("AI Model")["Adjudicated Hallucination"]
+         .agg(n="count", k="sum")
+         .reset_index())
+tab["rate"] = tab["k"] / tab["n"]
+tab[["ci_lo","ci_hi"]] = tab.apply(
+    lambda r: pd.Series(wilson_ci(int(r["k"]), int(r["n"]))), axis=1
+)
+
+# --- Plot (bar + Wilson 95% CI whiskers) ---
+tab = tab.sort_values("AI Model")  # or sort_values("rate", ascending=False)
+x = np.arange(len(tab))
+
+plt.rcParams.update({"figure.dpi": 140})
+fig, ax = plt.subplots(figsize=(6,4))
+ax.bar(x, tab["rate"], width=0.6, alpha=0.85)
+yerr = np.vstack([tab["rate"] - tab["ci_lo"], tab["ci_hi"] - tab["rate"]])
+ax.errorbar(x, tab["rate"], yerr=yerr, fmt="none", capsize=5, linewidth=1)
+
+ax.set_xticks(x); ax.set_xticklabels(tab["AI Model"])
+ax.set_ylim(0, 1)
+ax.set_ylabel("Hallucination rate (proportion with 1)")
+ax.set_title("Adjudicated Hallucination Rate by Model (Wilson 95% CI)")
+
+# show counts above bars
+for xi, r, n, k in zip(x, tab["rate"], tab["n"], tab["k"]):
+    ax.text(xi, r + 0.04, f"{int(k)}/{int(n)}", ha="center", fontsize=9)
+
+plt.tight_layout()
+plt.show()
+
+# Also print the table with intervals
+print(tab[["AI Model","n","k","rate","ci_lo","ci_hi"]].round(3))

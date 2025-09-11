@@ -4,125 +4,170 @@ import numpy as np
 from itertools import combinations
 from scipy import stats
 from pathlib import Path
+from typing import List, Optional, Dict, Any
 
-# --- Load ---
-df = pd.read_csv("data/results.csv")
+DATA_FILE = "data/results.csv"
+OUTPUT_DIR = Path("tables")
+TARGET_COLS = ["ragas_answer_correctness", "accuracy_rubric", "hb_accuracy"]
+GROUP_COL = "model"
+BOOTSTRAP_SAMPLES = 10000
+BOOTSTRAP_SEED = 12345
+CONFIDENCE_LEVEL = 0.95
 
-# --- Standardize column names (only those present will be renamed) ---
-rename_map = {
-    "Question N": "question_id",
-    "Answer_ID": "answer_id",
-    "AI Model": "model",
-    "Task": "task_label",
-    "Specificity": "specific_abstract",
-    "Specific/ Abstract": "specific_abstract",
-    "Single-Hop/Multi-Hop": "hop_label",
-    "Automated_Evaluation_Response Relevancy": "ragas_response_relevancy",
-    "Automated_Evaluation_Answer Correctness": "ragas_answer_correctness",
-    "Automated_Evaluation_Relevance Rubric": "relevance_rubric",
-    "Automated_Evaluation_Accuracy Rubric": "accuracy_rubric",
-    "HB_Accuracy": "hb_accuracy",
-}
-df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-# --- Ensure required columns exist and are numeric ---
-cols = ["ragas_answer_correctness", "accuracy_rubric", "hb_accuracy"]
-missing = [c for c in cols if c not in df.columns]
-if missing:
-    raise ValueError(f"Missing required columns in results.csv: {missing}")
-
-for c in cols:
-    df[c] = pd.to_numeric(df[c], errors="coerce")
-
-# Drop rows with any missing among the three columns
-work = df.dropna(subset=cols).copy()
-
-# -------------------------
-# Bootstrap Spearman helper
-# -------------------------
-def spearman_with_bootstrap(x, y, B=10000, seed=12345, alpha=0.05):
+def spearman_with_bootstrap(
+        x: pd.Series,
+        y: pd.Series,
+        B: int = BOOTSTRAP_SAMPLES,
+        seed: int = BOOTSTRAP_SEED,
+        alpha: float = 1 - CONFIDENCE_LEVEL
+) -> Dict[str, Any]:
     """
     Compute Spearman's rho, p-value, and bootstrap (percentile) CI.
     Resamples paired rows with replacement.
     """
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+
     # Remove NaNs pairwise
-    m = np.isfinite(x) & np.isfinite(y)
-    x, y = x[m], y[m]
-    n = len(x)
+    mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+    x_clean, y_clean = x_arr[mask], y_arr[mask]
+    n = len(x_clean)
 
     if n < 3:
-        return dict(n=n, rho=np.nan, p_value=np.nan,
-                    boot_mean=np.nan, ci_lo=np.nan, ci_hi=np.nan)
+        return {
+            "n": n, "rho": np.nan, "p_value": np.nan,
+            "boot_mean": np.nan, "ci_lo": np.nan, "ci_hi": np.nan
+        }
 
     # Point estimate and p-value
-    rho, p = stats.spearmanr(x, y)
+    rho, p_value = stats.spearmanr(x_clean, y_clean)
 
     # Bootstrap
     rng = np.random.default_rng(seed)
-    boots = []
+    bootstrapped_rhos = []
     for _ in range(B):
-        idx = rng.integers(0, n, n)  # resample paired rows
-        xb = x[idx]
-        yb = y[idx]
+        idx = rng.integers(0, n, n)
+        xb, yb = x_clean[idx], y_clean[idx]
         r, _ = stats.spearmanr(xb, yb)
-        # Handle degenerate samples (constant ranks → nan)
         if np.isfinite(r):
-            boots.append(r)
+            bootstrapped_rhos.append(r)
 
-    if len(boots) < max(200, int(0.5 * B)):  # too many degenerate resamples → unreliable CI
-        boot_mean = np.nan
-        lo = np.nan
-        hi = np.nan
+    # Check for too many degenerate resamples
+    if len(bootstrapped_rhos) < max(200, int(0.5 * B)):
+        boot_mean, ci_lo, ci_hi = np.nan, np.nan, np.nan
     else:
-        boots = np.asarray(boots)
-        boot_mean = float(np.mean(boots))
-        lo, hi = np.quantile(boots, [alpha/2, 1 - alpha/2])
-        lo = float(lo); hi = float(hi)
+        bootstrapped_rhos = np.asarray(bootstrapped_rhos)
+        boot_mean = float(np.mean(bootstrapped_rhos))
+        ci_lo, ci_hi = np.quantile(bootstrapped_rhos, [alpha / 2, 1 - alpha / 2])
+        ci_lo = float(ci_lo)
+        ci_hi = float(ci_hi)
 
-    return dict(n=n, rho=float(rho), p_value=float(p),
-                boot_mean=boot_mean, ci_lo=lo, ci_hi=hi)
+    return {
+        "n": n,
+        "rho": float(rho),
+        "p_value": float(p_value),
+        "boot_mean": boot_mean,
+        "ci_lo": ci_lo,
+        "ci_hi": ci_hi
+    }
 
-# -------------------------
-# Compute for all pairs
-# -------------------------
-from itertools import combinations
 
-def spearman_pairs_with_bootstrap(data, columns, group_col=None, B=10000, seed=12345):
+def spearman_pairs_with_bootstrap(
+        data: pd.DataFrame,
+        columns: List[str],
+        group_col: Optional[str] = None,
+        B: int = BOOTSTRAP_SAMPLES,
+        seed: int = BOOTSTRAP_SEED
+) -> pd.DataFrame:
+    """
+    Compute Spearman correlations for all pairs of columns, with bootstrap CIs.
+    Optionally group by a column.
+    """
     pairs = list(combinations(columns, 2))
     rows = []
-    if group_col is None:
-        for x, y in pairs:
-            res = spearman_with_bootstrap(data[x], data[y], B=B, seed=seed)
-            rows.append({"group": "ALL", "var_x": x, "var_y": y, **res})
+
+    if group_col and group_col in data.columns:
+        groups = data.groupby(group_col, dropna=False)
     else:
-        for g, gdf in data.groupby(group_col, dropna=False):
-            for x, y in pairs:
-                res = spearman_with_bootstrap(gdf[x], gdf[y], B=B, seed=seed)
-                rows.append({"group": g, "var_x": x, "var_y": y, **res})
+        groups = [("ALL", data)]
+
+    for group_name, group_df in groups:
+        for x_col, y_col in pairs:
+            result = spearman_with_bootstrap(group_df[x_col], group_df[y_col], B=B, seed=seed)
+            rows.append({"group": group_name, "var_x": x_col, "var_y": y_col, **result})
+
     return pd.DataFrame(rows).sort_values(["group", "var_x", "var_y"]).reset_index(drop=True)
 
-# --- Overall (all data) ---
-overall = spearman_pairs_with_bootstrap(work, cols, group_col=None, B=10000, seed=42)
 
-# --- Per-model breakdown (optional) ---
-if "model" in work.columns:
-    by_model = spearman_pairs_with_bootstrap(work, cols, group_col="model", B=10000, seed=42)
-else:
-    by_model = pd.DataFrame(columns=["group","var_x","var_y","n","rho","p_value","boot_mean","ci_lo","ci_hi"])
+def load_and_prepare_data(file_path: str, columns_to_check: List[str]) -> pd.DataFrame:
+    """Load data, rename columns, ensure numeric types, and drop NaNs."""
+    df = pd.read_csv(file_path)
 
-# --- Nicely print and save ---
-pd.options.display.float_format = "{:.3f}".format
-print("\n=== Spearman correlations with bootstrap 95% CI (ALL data) ===")
-print(overall)
+    rename_map = {
+        "Question N": "question_id", "Answer_ID": "answer_id", "AI Model": "model",
+        "Task": "task_label", "Specificity": "specific_abstract",
+        "Specific/ Abstract": "specific_abstract", "Single-Hop/Multi-Hop": "hop_label",
+        "Automated_Evaluation_Response Relevancy": "ragas_response_relevancy",
+        "Automated_Evaluation_Answer Correctness": "ragas_answer_correctness",
+        "Automated_Evaluation_Relevance Rubric": "relevance_rubric",
+        "Automated_Evaluation_Accuracy Rubric": "accuracy_rubric",
+        "HB_Accuracy": "hb_accuracy",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-if len(by_model):
-    print("\n=== Spearman correlations with bootstrap 95% CI (by model) ===")
-    print(by_model)
+    missing_cols = [c for c in columns_to_check if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns in {file_path}: {missing_cols}")
 
-OUT = Path("tables"); OUT.mkdir(exist_ok=True, parents=True)
-overall.to_csv(OUT / "spearman_overall_bootstrap.csv", index=False)
-by_model.to_csv(OUT / "spearman_by_model_bootstrap.csv", index=False)
+    for col in columns_to_check:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df.dropna(subset=columns_to_check).copy()
 
 
+def main():
+    """
+    Main script execution: load data, compute correlations, print and save results.
+    """
+    # --- Data Loading and Preparation ---
+    try:
+        work_df = load_and_prepare_data(DATA_FILE, TARGET_COLS)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}")
+        return
+
+    # --- Computations ---
+    # Overall correlations
+    overall_corr = spearman_pairs_with_bootstrap(
+        work_df, TARGET_COLS, group_col=None, B=BOOTSTRAP_SAMPLES, seed=BOOTSTRAP_SEED
+    )
+
+    # Per-model correlations
+    if GROUP_COL in work_df.columns:
+        by_model_corr = spearman_pairs_with_bootstrap(
+            work_df, TARGET_COLS, group_col=GROUP_COL, B=BOOTSTRAP_SAMPLES, seed=BOOTSTRAP_SEED
+        )
+    else:
+        by_model_corr = pd.DataFrame(
+            columns=["group", "var_x", "var_y", "n", "rho", "p_value", "boot_mean", "ci_lo", "ci_hi"]
+        )
+
+    # --- Output Results ---
+    pd.options.display.float_format = "{:.3f}".format
+    print("\n=== Spearman correlations with bootstrap 95% CI (ALL data) ===")
+    print(overall_corr)
+
+    if not by_model_corr.empty:
+        print(f"\n=== Spearman correlations with bootstrap 95% CI (by {GROUP_COL}) ===")
+        print(by_model_corr)
+
+    # Save to CSV
+    OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+    overall_corr.to_csv(OUTPUT_DIR / "spearman_overall_bootstrap.csv", index=False)
+    by_model_corr.to_csv(OUTPUT_DIR / "spearman_by_model_bootstrap.csv", index=False)
+    print(f"\nResults saved to '{OUTPUT_DIR}' directory.")
+
+
+if __name__ == "__main__":
+    main()

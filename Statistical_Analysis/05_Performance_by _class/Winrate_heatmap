@@ -1,0 +1,127 @@
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from pathlib import Path
+from scipy.stats import norm
+
+# Load your data (use your DataFrame name if already loaded)
+df = pd.read_csv("data/classified_27.csv")  # Make sure this path is correct
+
+# Normalize column names
+df = df.rename(columns={
+    "Question N": "question_id",
+    "Answer_ID": "answer_id",
+    "AI Model": "model",
+    "Specific/ Abstract": "specific_abstract",
+    "Single-Hop/Multi-Hop": "hop_label",
+    "Response Relevancy": "response_relevancy",
+    "HB_Accuracy": "hb_acc",
+    "Task": "task"
+})
+
+# Canonical model order + palette
+order = ["CGPT", "RALF", "NBLM"]
+palette = {"CGPT": "#556B2F", "RALF": "#800020", "NBLM": "#B8860B"}
+df["model"] = pd.Categorical(df["model"], categories=order, ordered=True)
+
+# 1) Slope charts (paired per question) — by classification facet (example: task)
+#    *** CHANGED: legend now shows question_id (one line per question) ***
+def slope_by_class(facet_col="task", metric="hb_acc"):
+    cats = df[facet_col].unique()
+    for c in cats:
+        sub = df[df[facet_col] == c].copy()
+        if sub.empty: 
+            continue
+        wide = sub.pivot_table(index="question_id", columns="model", values=metric, aggfunc="first").dropna()
+        if wide.empty: 
+            continue
+        plt.figure(figsize=(6, 4))
+        for q, row in wide.iterrows():
+            xs = np.arange(len(order))
+            ys = row[order].values
+            plt.plot(xs, ys, marker="o", alpha=0.8, label=str(q))
+        plt.xticks(np.arange(len(order)), order)
+        plt.legend(title="question_id", frameon=False)
+        plt.title(f"Question Classification— {facet_col}: {c}")
+        plt.ylabel(metric)
+        plt.tight_layout()
+        plt.show()
+
+print("--- Generating Slope Charts ---")
+slope_by_class("task", "hb_acc")
+slope_by_class("specific_abstract", "hb_acc")
+slope_by_class("hop_label", "hb_acc")
+
+# 2) Win-rate with Wilson CI (per class): % of questions where a model is best on HB_Accuracy
+def wilson_ci(k, n, alpha=0.05):
+    if n == 0: return np.nan, np.nan
+    z = norm.ppf(1 - alpha / 2)
+    phat = k / n
+    denom = 1 + (z * z) / n
+    centre = (phat + (z * z) / (2 * n)) / denom
+    half = (z * np.sqrt((phat * (1 - phat) / n) + (z * z) / (4 * n * n))) / denom
+    return centre - half, centre + half
+
+def winrate_plot(facet_col="task", metric="hb_acc"):
+    cats = df[facet_col].unique()
+    rows = []
+    for c in cats:
+        sub = df[df[facet_col] == c]
+        wide = sub.pivot_table(index="question_id", columns="model", values=metric, aggfunc="first").dropna()
+        if wide.empty: continue
+        # ties: count all tied winners
+        winners = wide.apply(lambda r: (r == r.max()).astype(int), axis=1)
+        for m in order:
+            k = int(winners[m].sum())
+            n = int(len(wide))
+            lo, hi = wilson_ci(k, n)
+            rows.append({"class": c, "model": m, "n_q": n, "wins": k, "rate": k / n, "ci_lo": lo, "ci_hi": hi})
+    tab = pd.DataFrame(rows)
+    if tab.empty: return
+    
+    print(f"\n--- Win Rate Table for {facet_col} ---")
+    print(tab)
+    
+    # Plot
+    for c in tab["class"].unique():
+        t = tab[tab["class"] == c].sort_values("model")
+        x = np.arange(len(t))
+        plt.figure(figsize=(6, 4))
+        plt.bar(x, t["rate"], color=[palette[m] for m in t["model"]], alpha=0.9)
+        yerr = np.vstack([t["rate"] - t["ci_lo"], t["ci_hi"] - t["rate"]])
+        plt.errorbar(x, t["rate"], yerr=yerr, fmt="none", capsize=5, linewidth=1, color="black")
+        plt.xticks(x, t["model"])
+        plt.ylim(0, 1)
+        for xi, r, k, n in zip(x, t["rate"], t["wins"], t["n_q"]):
+            plt.text(xi, r + 0.04, f"{k}/{n}", ha="center", fontsize=9)
+        plt.ylabel("Win rate (best on HB_Accuracy)")
+        plt.title(f"{facet_col}: {c}")
+        plt.tight_layout()
+        plt.show()
+
+print("\n--- Generating Win-Rate Plots ---")
+winrate_plot("task", "hb_acc")
+winrate_plot("specific_abstract", "hb_acc")
+winrate_plot("hop_label", "hb_acc")
+
+metric_to_plot = "hb_acc"
+wide_df = df.pivot_table(index="question_id", columns="model", values=metric_to_plot, aggfunc="first")
+
+# Sort the questions by their mean score to make patterns more visible
+wide_df['mean_score'] = wide_df.mean(axis=1)
+wide_df = wide_df.sort_values('mean_score', ascending=False).drop('mean_score', axis=1)
+
+plt.figure(figsize=(8, 7))
+ax = sns.heatmap(
+    wide_df,
+    annot=True,         # Show the scores in each cell
+    cmap="crest",     
+    linewidths=.5,
+    cbar_kws={'label': f'{metric_to_plot} Score'} # Label for the color bar
+)
+ax.set_title(f'Per-Question Accuracy ({metric_to_plot}) by Model', fontsize=16, pad=20)
+ax.set_xlabel("AI Model", fontsize=12)
+ax.set_ylabel("Question ID", fontsize=12)
+plt.tight_layout()
+plt.show()

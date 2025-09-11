@@ -36,34 +36,37 @@ Question N,Answer_ID,AI Model,H1_Correct,H1_Relevant,H1_Complete,H1_Hallucinatio
 
 df = pd.read_csv(io.StringIO(data))
 
-# For this calculation, we only need the raw scores from each human.
-h1_correct = df['H1_Correct']
-h2_correct = df['H2_Correct']
-
-h1_relevant = df['H1_Relevant']
-h2_relevant = df['H2_Relevant']
-
-h1_hallucination = df['H1_Hallucination']
-h2_hallucination = df['H2_Hallucination']
-
-# 2. Calculate Cohen's Kappa for each metric
-kappa_correct = cohen_kappa_score(h1_correct, h2_correct)
-kappa_relevant = cohen_kappa_score(h1_relevant, h2_relevant)
-kappa_hallucination = cohen_kappa_score(h1_hallucination, h2_hallucination)
-
-# 3. a "weighted" Kappa.
-# This gives partial credit for close disagreements (e.g., a 4 vs 5 is better than a 1 vs 5).
-weighted_kappa_correct = cohen_kappa_score(h1_correct, h2_correct, weights='linear')
-weighted_kappa_relevant = cohen_kappa_score(h1_relevant, h2_relevant, weights='linear')
-
-
+metrics_config = {
+    "Correctness": {"col": "Correct", "agreement": "Fair Agreement"},
+    "Relevance": {"col": "Relevant", "agreement": "Fair Agreement"},
+    "Hallucination": {"col": "Hallucination", "agreement": "Moderate Agreement"}
+}
 
 print("Inter-Rater Reliability Analysis:")
 print("-" * 35)
-print(f"Correctness (Standard Kappa): {kappa_correct:.2f} (Fair Agreement)")
-print(f"Relevance (Standard Kappa):   {kappa_relevant:.2f} (Fair Agreement)")
-print(f"Hallucination (Standard Kappa): {kappa_hallucination:.2f} (Moderate Agreement)")
+
+for name, config in metrics_config.items():
+    kappa = cohen_kappa_score(df[f'H1_{config["col"]}'], df[f'H2_{config["col"]}'])
+    label = f"{name} (Standard Kappa):"
+
+    if name == "Relevance":
+        print(f"{label}   {kappa:.2f} ({config['agreement']})")
+    else:
+        print(f"{label} {kappa:.2f} ({config['agreement']})")
+
 print("-" * 35)
 print("Analysis with Weighted Kappa (for ordinal scales):")
-print(f"Correctness (Weighted Kappa): {weighted_kappa_correct:.2f} (X Agreement)")
-print(f"Relevance (Weighted Kappa):   {weighted_kappa_relevant:.2f} (X Agreement)")
+
+# Calculate and print weighted Kappa scores
+for name, config in metrics_config.items():
+    if name == "Hallucination":
+        continue
+
+    weighted_kappa = cohen_kappa_score(df[f'H1_{config["col"]}'], df[f'H2_{config["col"]}'], weights='linear')
+    label = f"{name} (Weighted Kappa):"
+
+    # Preserve original output's spacing
+    if name == "Relevance":
+        print(f"{label}   {weighted_kappa:.2f} (X Agreement)")
+    else:
+        print(f"{label} {weighted_kappa:.2f} (X Agreement)")

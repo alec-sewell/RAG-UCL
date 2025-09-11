@@ -1,0 +1,125 @@
+import pandas as pd
+import numpy as np
+import io
+import matplotlib.pyplot as plt
+
+# --- 1. Load Your Data ---
+# The data is loaded from a multiline string for reproducibility.
+data = """
+AI Model,Hallucinate
+NBLM,0.0
+RALF,0.0
+CGPT,0.0
+RALF,1.0
+CGPT,0.0
+NBLM,0.0
+CGPT,0.0
+RALF,0.0
+NBLM,0.0
+RALF,1.0
+NBLM,0.0
+CGPT,0.0
+CGPT,0.0
+NBLM,0.0
+RALF,1.0
+NBLM,0.0
+CGPT,1.0
+RALF,0.0
+RALF,0.0
+CGPT,1.0
+NBLM,1.0
+CGPT,0.0
+RALF,0.0
+NBLM,0.0
+NBLM,0.0
+RALF,1.0
+CGPT,0.0
+"""
+
+# Use skipinitialspace=True to automatically handle potential extra spaces in column names
+df = pd.read_csv(io.StringIO(data), skipinitialspace=True)
+
+
+# --- 2. Define the Bootstrapping Function ---
+def bootstrap_hallucination_rate(data, n_bootstraps=10000, seed=42):
+    """
+    Calculates the 95% CI for the hallucination rate (where 0 is a hallucination)
+    by resampling the input data thousands of times.
+    """
+    # Set a random seed for reproducible results
+    rng = np.random.default_rng(seed)
+    
+    # Ensure data is a NumPy array for efficient processing
+    data = np.asarray(data)
+    n_samples = len(data)
+    bootstrap_rates = []
+
+    # Loop to create and analyze thousands of simulated datasets
+    for _ in range(n_bootstraps):
+        # Create a new dataset by drawing samples from the original data with replacement
+        resample = rng.choice(data, size=n_samples, replace=True)
+        
+        # Calculate the hallucination rate for the simulated dataset
+        # This is the proportion of times a hallucination (value of 0) occurred
+        hallucination_rate = np.sum(resample == 0) / n_samples
+        bootstrap_rates.append(hallucination_rate)
+
+    # Determine the 95% confidence interval by finding the 2.5th and 97.5th percentiles
+    ci_lower = np.percentile(bootstrap_rates, 2.5)
+    ci_upper = np.percentile(bootstrap_rates, 97.5)
+
+    return ci_lower, ci_upper
+
+
+# --- 3. Run the Analysis for Each Model ---
+results = []
+# Sort the model names to ensure the output is always in the same order
+models = sorted(df['AI Model'].unique())
+
+for model in models:
+    # Isolate the data for the current model
+    model_data = df[df['AI Model'] == model]['Hallucinate']
+    
+    # Calculate the simple, observed hallucination rate from the original data
+    observed_rate = np.sum(model_data == 0) / len(model_data)
+    
+    # Run the bootstrapping function to get the 95% CI
+    ci_low, ci_high = bootstrap_hallucination_rate(model_data)
+    
+    results.append({
+        'AI Model': model,
+        'Hallucination Rate': observed_rate,
+        '95% CI Lower': ci_low,
+        '95% CI Upper': ci_high
+    })
+
+# Convert the results into a clean pandas DataFrame for display
+results_df = pd.DataFrame(results)
+print("Bootstrapped Hallucination Rate Analysis:")
+print(results_df.round(3))
+
+
+# --- 4. Visualize the Results ---
+fig, ax = plt.subplots(figsize=(8, 6))
+
+# Calculate the size of the error bars for the plot
+results_df['error_low'] = results_df['Hallucination Rate'] - results_df['95% CI Lower']
+results_df['error_high'] = results_df['95% CI Upper'] - results_df['Hallucination Rate']
+errors = [results_df['error_low'], results_df['error_high']]
+
+# Create the bar plot with the calculated error bars representing the 95% CI
+results_df.plot(kind='bar', x='AI Model', y='Hallucination Rate', yerr=errors,
+                ax=ax, capsize=5, legend=False, rot=0, color=['skyblue', 'salmon', 'lightgreen'])
+
+# Add titles and labels for clarity
+ax.set_title('Hallucination Rates with 95% Confidence Intervals', fontsize=16, pad=20)
+ax.set_ylabel('Hallucination Rate (0 = Hallucination)', fontsize=12)
+ax.set_xlabel('AI Model', fontsize=12)
+ax.grid(axis='y', linestyle='--', alpha=0.7)
+
+# Format the y-axis to show percentages
+ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.0%}'))
+
+# Display the plot
+plt.tight_layout()
+plt.show()

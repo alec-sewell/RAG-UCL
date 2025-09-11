@@ -5,8 +5,48 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.ticker import MaxNLocator
 
-# 1. Load your data from a string into a pandas DataFrame
-data = """
+
+def load_data(data_string: str) -> pd.DataFrame:
+    """Loads data from a string into a pandas DataFrame."""
+    return pd.read_csv(io.StringIO(data_string))
+
+
+def analyze_correlations(df: pd.DataFrame):
+    """Calculates and prints Pearson and Spearman correlations."""
+    # Pearson's r for linear correlation
+    pearson_corr, pearson_p_value = stats.pearsonr(df['HB_Accuracy'], df['Hallucinate'])
+
+    # Spearman's rho for monotonic correlation (robust for non-normal data)
+    spearman_corr, spearman_p_value = stats.spearmanr(df['HB_Accuracy'], df['Hallucinate'])
+
+    print("Correlation Analysis Results:")
+    print("-" * 30)
+    print(f"Pearson's r: {pearson_corr:.4f}")
+    print(f"P-value: {pearson_p_value:e}")
+    print(f"\nSpearman's ρ: {spearman_corr:.4f}")
+    print(f"P-value: {spearman_p_value:e}")
+    print("-" * 30)
+
+
+def visualize_relationship(df: pd.DataFrame):
+    """Creates, saves, and shows a scatter plot of the relationship."""
+    plt.figure(figsize=(8, 8))
+
+    ax = sns.regplot(x='HB_Accuracy', y='Hallucinate', data=df,
+                     scatter_kws={'s': 80, 'color': '#800020'},
+                     line_kws={'color': 'red', 'linestyle': '--'})
+
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    plt.grid(True)
+    plt.axis('equal')
+    plt.tight_layout()
+    plt.savefig('correlation_plot_edited.png', dpi=300)
+    plt.show()
+
+
+def main():
+    """Main function to run the data analysis and visualization."""
+    data = """
 Answer_ID,HB_Accuracy,Hallucinate
 1A,2.5,0.0
 1B,2.0,0.0
@@ -35,44 +75,11 @@ Answer_ID,HB_Accuracy,Hallucinate
 9A,2.5,0.0
 9B,5.0,1.0
 9C,4.5,0.5
-
-
 """
-
-df = pd.read_csv(io.StringIO(data))
-
-# 2. Calculate Correlation Coefficients
-# Pearson's r for linear correlation
-pearson_corr, pearson_p_value = stats.pearsonr(df['HB_Accuracy'], df['Hallucinate'])
-
-# Spearman's rho for monotonic correlation (robust for non-normal data)
-spearman_corr, spearman_p_value = stats.spearmanr(df['HB_Accuracy'], df['Hallucinate'])
-
-print("Correlation Analysis Results:")
-print("-" * 30)
-print(f"Pearson's r: {pearson_corr:.4f}")
-print(f"P-value: {pearson_p_value:e}")
-print(f"\nSpearman's ρ: {spearman_corr:.4f}")
-print(f"P-value: {spearman_p_value:e}")
-print("-" * 30)
+    df = load_data(data)
+    analyze_correlations(df)
+    visualize_relationship(df)
 
 
-# 3. Visualize the relationship with a scatter plot
-plt.figure(figsize=(8, 8))
-
-# regplot adds a scatter plot and a linear regression line
-# EDITS: Changed the scatter_kws to set the color to burgundy
-sns.regplot(x='HB_Accuracy', y='Hallucinate', data=df,
-            scatter_kws={'s': 80, 'color': '#800020'},
-            line_kws={'color': 'red', 'linestyle': '--'})
-
-# EDITS: Get the current axes and set the Y-axis locator to force integer ticks
-ax = plt.gca()
-ax.yaxis.set_major_locator(MaxNLocator(integer=True))
-
-plt.grid(True)
-plt.axis('equal') # Ensure the x and y axes have the same scale
-plt.tight_layout()
-plt.savefig('correlation_plot_edited.png', dpi=300)
-plt.show()
-
+if __name__ == "__main__":
+    main()
