@@ -14,7 +14,7 @@ The project is organized into the following main directories:
     -   **`Requirements.txt`**: A list of Python dependencies required to run the project.
     -   **`.env`**: A file for environment variable configurations, such as API keys.
 
--   **`RAGAS_Automated_Eval/`**: This directory contains scripts and notebooks dedicated to the automated evaluation of the RAG pipeline, likely utilizing the RAGAs framework.
+-   **`RAGAS_Automated_Eval/`**: This directory contains scripts and notebooks dedicated to the automated evaluation of the RAG pipeline, utilizing the RAGAs framework.
 
 -   **`Statistical_Analysis/`**: Provides scripts and tools for performing statistical analysis on the data gathered from RAG evaluations.
 
